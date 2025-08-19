@@ -1,0 +1,20 @@
+{
+  "axis_hostname": "192.168.1.27",
+  "axis_username": "loxone",
+  "axis_password": "halloloxone",
+  "active_timeout": 15,
+  "button_pins": [16, 20, 21],
+  "button_debounce_ms": 200,
+  "led_pin": 17,
+  "image_cache_ttl_secs": 2,
+  "udp_listen_port": 9999,
+  "udp_broadcast_enabled": false,
+  "udp_bcast_addr": "255.255.255.255",
+  "udp_bcast_port": 9999,
+  "udp_bcast_interval": 5,
+  "log_level": "INFO",
+  "sip_enabled": false,
+  "sip_port": 5060,
+  "sip_user": "door",
+  "sip_domain": "doorbell.local"
+}

@@ -1,59 +1,106 @@
 # Doorbell System
 
-This project implements a doorbell system using a Raspberry Pi. The system consists of three buttons that, when pressed, send a UDP broadcast with the corresponding button number.
+A Raspberry Pi doorbell system with SIP calling capabilities, video streaming, and GPIO button handling.
 
-## Project Structure
+## Quick Start
 
-```
-doorbell-system
-├── src
-│   ├── main.py               # Entry point of the application
-│   ├── doorbell
-│   │   ├── __init__.py       # Marks the directory as a Python package
-│   │   ├── buttons.py         # Button class for handling button events
-│   │   └── udp_broadcast.py   # Function to send UDP broadcasts
-├── requirements.txt           # Project dependencies
-└── README.md                  # Project documentation
+### Install and Run with uvx (Recommended)
+
+```bash
+# Install and run directly from GitHub
+uvx bernhardrode/doorbell
+
+# Or install from PyPI (when published)
+uvx doorbell
 ```
 
-## Setup Instructions
+### Manual Installation
 
-1. **Clone the repository:**
-   ```bash
-   git clone <repository-url>
-   cd doorbell-system
-   ```
+```bash
+# Clone and install
+git clone https://github.com/bernhardrode/doorbell.git
+cd doorbell
+pip install .
 
-2. **Install dependencies:**
-   Make sure you have Python and uv installed. Then run:
-   ```bash
-   uv sync
-   ```
+# Run
+doorbell
+```
 
-3. **Connect the buttons:**
-   Connect three buttons to the GPIO pins of your Raspberry Pi.
+## Configuration
 
-4. **Run the application:**
-   Execute the main script:
-   ```bash
-   uv run main.py
-   ```
+Create a config file at `~/.config/doorbell.json`:
 
-## Application Features
+```json
+{
+  "axis_hostname": "192.168.1.27",
+  "axis_username": "loxone", 
+  "axis_password": "your-password",
+  "active_timeout": 15,
+  "button_pins": [16, 20, 21],
+  "led_pin": 17,
+  "sip_enabled": true,
+  "sip_port": 5060
+}
+```
 
-When a button is pressed, the system will send a UDP broadcast message containing the button number (1, 2, or 3). Ensure that your network allows UDP broadcasts for the messages to be received by other devices.
+Or use environment variables:
+```bash
+export AXIS_HOSTNAME=192.168.1.27
+export AXIS_PASSWORD=your-password
+doorbell
+```
 
-we have two proxy endpoints /video or /image they proxy to a axis camera with basic auth (configure in ENVIRONMENT variables)
+## Features
 
-http://192.168.1.27/axis-cgi/jpg/image.cgi?&camera=1
-http://192.168.1.27/axis-cgi/mjpg/video.cgi
+### Core Features
+- **GPIO Button Handling**: Three buttons connected to GPIO pins
+- **UDP Broadcasting**: Sends messages when buttons are pressed
+- **Video Streaming**: Proxy to Axis camera MJPEG stream
+- **Image Caching**: Dynamic caching (60s normal, 2s when active)
+- **LED Status**: Visual indicator for active state
+- **HTTP API**: RESTful endpoints for status and control
 
-After the door bell rings, we go into active mode. Active Means, we wait for somebody in the house to open their Loxone App. 
+### SIP Features
+- **SIP Server**: Accepts incoming calls on port 5060
+- **Call Management**: Proper SIP protocol handling (INVITE, BYE, ACK)
+- **Active State Integration**: Stays active during calls
+- **Auto-answer**: Automatically answers calls after 3 seconds
+- **Call Timeout**: 60-second maximum call duration
+- **Manual Hangup**: API endpoint to terminate calls
 
-Also we have to provide a SIP server, where our clients can connect to and speak with a person in front of the door using
+## API Endpoints
 
-If nobody answers the call within one minute, we should store the last recorded minute to a file, stop and hangup.
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/status` | GET | System status including SIP call state |
+| `/image` | GET | Latest cached camera image (JPEG) |
+| `/video` | GET | Live camera video stream (MJPEG) |
+| `/sip/hangup` | POST | Manually hang up active SIP call |
+| `/healthz` | GET | Health check |
+
+## Hardware Requirements
+
+- **Raspberry Pi** (3B+ or newer recommended)
+- **3 Push Buttons** connected to GPIO
+- **1 LED** for status indication
+- **Axis Network Camera** with MJPEG support
+- **Network Connection** for camera and SIP clients
+
+## Development
+
+```bash
+# Clone repository
+git clone https://github.com/bernhardrode/doorbell.git
+cd doorbell
+
+# Install in development mode
+pip install -e ".[dev]"
+
+# Run tests
+python -m doorbell.test_doorbell
+python -m doorbell.test_sip_client
+```
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+MIT License - see LICENSE file for details.

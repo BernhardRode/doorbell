@@ -1084,7 +1084,8 @@ app = Starlette(routes=routes, lifespan=lifespan)
 # =============================================================================
 # Entrypoint
 # =============================================================================
-if __name__ == "__main__":
+def main():
+    """Entry point for the doorbell application"""
     import uvicorn
     # --- MODIFICATION: Added log_config=None to prevent Uvicorn from
     # --- overriding our logging setup.
@@ -1094,3 +1095,6 @@ if __name__ == "__main__":
         port=8000,
         log_config=None
     )
+
+if __name__ == "__main__":
+    main()
