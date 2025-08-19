@@ -13,7 +13,7 @@
   "udp_bcast_port": 9999,
   "udp_bcast_interval": 5,
   "log_level": "INFO",
-  "sip_enabled": false,
+  "sip_enabled": true,
   "sip_port": 5060,
   "sip_user": "door",
   "sip_domain": "doorbell.local"

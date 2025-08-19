@@ -67,6 +67,12 @@ from starlette.responses import (JSONResponse, PlainTextResponse, Response,
                                  StreamingResponse)
 from starlette.routing import Route
 
+try:
+    import pyaudio
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
+
 # --- GPIO import (optionally stubbed for non-Pi dev) --------------------------
 GPIO_FAKE = os.environ.get("GPIO_FAKE", "0") == "1"
 try:
@@ -163,6 +169,8 @@ class Settings:
         object.__setattr__(self, 'SIP_USER', os.environ.get("SIP_USER", config.get("sip_user", "door")))
         object.__setattr__(self, 'SIP_DOMAIN', os.environ.get("SIP_DOMAIN", config.get("sip_domain", "doorbell.local")))
         object.__setattr__(self, 'SIP_ENABLED', os.environ.get("SIP_ENABLED", str(config.get("sip_enabled", True))).lower() in ("1", "true"))
+        
+        # TTS Configuration - removed, audio comes via SIP
 
 settings = Settings()
 
@@ -191,6 +199,51 @@ for handler in logging.getLogger().handlers:
 
 logger = logging.getLogger("doorbell")
 START_TIME = time.time()
+
+
+# =============================================================================
+# Audio Manager
+# =============================================================================
+class AudioManager:
+    def __init__(self, settings: Settings):
+        self._settings = settings
+        self._audio = None
+        self._stream = None
+        self._log = logging.getLogger("doorbell.audio")
+        
+    async def startup(self):
+        if not AUDIO_AVAILABLE:
+            self._log.info("PyAudio not available")
+            return
+            
+        try:
+            self._audio = pyaudio.PyAudio()
+            # Setup audio stream for playback
+            self._stream = self._audio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=8000,  # Standard for G.711
+                output=True,
+                frames_per_buffer=160  # 20ms at 8kHz
+            )
+            self._log.info("Audio system initialized")
+        except Exception as e:
+            self._log.error(f"Failed to initialize audio: {e}")
+            
+    async def play_audio(self, audio_data: bytes):
+        """Play audio data to speaker"""
+        if self._stream:
+            try:
+                self._stream.write(audio_data)
+            except Exception as e:
+                self._log.error(f"Audio playback error: {e}")
+                
+    async def shutdown(self):
+        if self._stream:
+            self._stream.stop_stream()
+            self._stream.close()
+        if self._audio:
+            self._audio.terminate()
 
 
 # =============================================================================
@@ -300,13 +353,16 @@ class CallState:
     answer_time: float = 0.0
 
 class SIPServer:
-    def __init__(self, settings: Settings, event_bus: EventBus):
+    def __init__(self, settings: Settings, event_bus: EventBus, audio_manager: 'AudioManager'):
         self._settings = settings
         self._event_bus = event_bus
+        self._audio_manager = audio_manager
         self._transport: asyncio.DatagramTransport | None = None
         self._call = CallState()
         self._auto_answer_task: asyncio.Task | None = None
         self._call_timeout_task: asyncio.Task | None = None
+        self._rtp_socket: socket.socket | None = None
+        self._rtp_task: asyncio.Task | None = None
         self._log = logging.getLogger("doorbell.sip")
 
     @property
@@ -409,9 +465,8 @@ class SIPServer:
         self._call_timeout_task = asyncio.create_task(self._call_timeout(call_id))
 
     async def _auto_answer_call(self, call_id: str, addr: tuple, headers: dict):
-        """Auto-answer call after delay"""
+        """Auto-answer call immediately"""
         try:
-            await asyncio.sleep(3)
             if self._call.state == "ringing" and self._call.call_id == call_id:
                 await self._answer_call(call_id, addr, headers)
         except asyncio.CancelledError:
@@ -422,12 +477,65 @@ class SIPServer:
         self._call.state = "active"
         self._call.answer_time = time.time()
         
-        # Send 200 OK
-        response = self._create_response(200, "OK", call_id, headers)
-        self._transport.sendto(response, addr)
+        # Setup RTP for audio
+        await self._setup_rtp()
+        
+        # Send 200 OK with SDP
+        sdp = f"""v=0
+o=doorbell 0 0 IN IP4 {socket.gethostbyname(socket.gethostname())}
+s=Doorbell
+c=IN IP4 {socket.gethostbyname(socket.gethostname())}
+t=0 0
+m=audio {self._rtp_port} RTP/AVP 0
+a=rtpmap:0 PCMU/8000"""
+        
+        response = f"SIP/2.0 200 OK\r\n"
+        response += f"Call-ID: {call_id}\r\n"
+        response += f"Via: {headers.get('via', '')}\r\n"
+        response += f"From: {headers.get('from', '')}\r\n"
+        response += f"To: {headers.get('to', '')}\r\n"
+        response += f"CSeq: {headers.get('cseq', '')}\r\n"
+        response += f"Content-Type: application/sdp\r\n"
+        response += f"Content-Length: {len(sdp)}\r\n\r\n{sdp}"
+        
+        self._transport.sendto(response.encode(), addr)
         
         self._log.info(f"Call answered with {addr}")
         await self._event_bus.emit("SIP_CALL_ANSWERED", addr)
+
+    async def _setup_rtp(self):
+        """Setup RTP socket for audio"""
+        try:
+            self._rtp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._rtp_socket.bind(('0.0.0.0', 0))
+            self._rtp_port = self._rtp_socket.getsockname()[1]
+            
+            # Start RTP receiver task
+            self._rtp_task = asyncio.create_task(self._rtp_receiver())
+            self._log.info(f"RTP listening on port {self._rtp_port}")
+        except Exception as e:
+            self._log.error(f"RTP setup failed: {e}")
+
+    async def _rtp_receiver(self):
+        """Receive and play RTP audio packets"""
+        try:
+            loop = asyncio.get_event_loop()
+            while self._call.state == "active":
+                # Receive RTP packet
+                data, addr = await loop.sock_recvfrom(self._rtp_socket, 1024)
+                
+                # Simple RTP parsing (skip 12-byte header)
+                if len(data) > 12:
+                    audio_payload = data[12:]
+                    # Play audio (G.711 PCMU format)
+                    await self._audio_manager.play_audio(audio_payload)
+                    
+        except Exception as e:
+            self._log.error(f"RTP receiver error: {e}")
+        finally:
+            if self._rtp_socket:
+                self._rtp_socket.close()
+                self._rtp_socket = None
 
     async def _handle_bye(self, msg: dict, addr: tuple):
         """Handle call termination"""
@@ -463,6 +571,10 @@ class SIPServer:
         if self._call_timeout_task:
             self._call_timeout_task.cancel()
             self._call_timeout_task = None
+            
+        if self._rtp_task:
+            self._rtp_task.cancel()
+            self._rtp_task = None
         
         # Send BYE if we're ending the call
         if reason in ("timeout", "hangup") and self._call.remote_addr:
@@ -1044,7 +1156,8 @@ active_state = ActiveState(event_bus, settings.ACTIVE_TIMEOUT)
 camera_fetcher = CameraFetcher(settings, active_state)
 video_stream = VideoStreamManager(settings)
 udp_server = UDPServer(settings, active_state, event_bus)
-sip_server = SIPServer(settings, event_bus)
+audio_manager = AudioManager(settings)
+sip_server = SIPServer(settings, event_bus, audio_manager)
 gpio_manager: GPIOManager | None = None
 
 # Link active state with SIP server
@@ -1065,6 +1178,7 @@ async def lifespan(app: Starlette):
     await camera_fetcher.startup()
     gpio_manager.start()
     await udp_server.start(loop)
+    await audio_manager.startup()
     await sip_server.start(loop)
     
     try:
@@ -1073,6 +1187,7 @@ async def lifespan(app: Starlette):
         logger.info("Application shutting down...")
         await udp_server.stop()
         await sip_server.stop()
+        await audio_manager.shutdown()
         if gpio_manager:
             gpio_manager.stop()
         await camera_fetcher.shutdown()

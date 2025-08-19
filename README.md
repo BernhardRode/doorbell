@@ -26,6 +26,27 @@ pip install .
 doorbell
 ```
 
+### Systemd Service (Raspberry Pi)
+
+After installation, set up the systemd service to run doorbell automatically:
+
+```bash
+# Install and enable the service (requires sudo)
+sudo doorbell-install-service
+
+# Start the service
+sudo systemctl start doorbell
+
+# Check status
+sudo systemctl status doorbell
+
+# View logs
+sudo journalctl -u doorbell -f
+
+# Uninstall the service (requires sudo)
+sudo doorbell-uninstall-service
+```
+
 ## Configuration
 
 Create a config file at `~/.config/doorbell.json`:
