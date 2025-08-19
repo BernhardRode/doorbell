@@ -31,9 +31,24 @@ Environment variables:
 """
 from __future__ import annotations
 
+import logging
+import re
+
+# =============================================================================
+# Credential Sanitization (MUST BE FIRST)
+# =============================================================================
+class SanitizeFilter(logging.Filter):
+    def filter(self, record):
+        if hasattr(record, 'msg'):
+            msg = str(record.msg)
+            record.msg = re.sub(r'://[^:]+:[^@]+@', '://***:***@', msg)
+        return True
+
+# Apply filter immediately to catch all logs
+logging.getLogger().addFilter(SanitizeFilter())
+
 import asyncio
 import json
-import logging
 import os
 import socket
 import sys
@@ -99,12 +114,14 @@ settings = Settings()
 # =============================================================================
 # Logging
 # =============================================================================
-class SanitizeFilter(logging.Filter):
-    def filter(self, record):
-        if hasattr(record, 'msg'):
-            # Replace credentials in URLs
-            record.msg = str(record.msg).replace(f"{settings.AXIS_USERNAME}:{settings.AXIS_PASSWORD}@", "***:***@")
-        return True
+class LogFormatter(logging.Formatter):
+    def format(self, record):
+        # Replace confusing logger names
+        if record.name == "uvicorn.error":
+            record.name = "uvicorn"
+        elif record.name == "uvicorn.access":
+            record.name = "access"
+        return super().format(record)
 
 # --- MODIFICATION: Added force=True to ensure this config takes precedence.
 logging.basicConfig(
@@ -113,10 +130,9 @@ logging.basicConfig(
     force=True,
 )
 
-# Add sanitize filter to all loggers
-for logger_name in ['doorbell', 'httpx', 'uvicorn.access', 'uvicorn.error']:
-    logger_obj = logging.getLogger(logger_name)
-    logger_obj.addFilter(SanitizeFilter())
+# Apply custom formatter to all handlers
+for handler in logging.getLogger().handlers:
+    handler.setFormatter(LogFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 
 logger = logging.getLogger("doorbell")
 START_TIME = time.time()
@@ -205,8 +221,53 @@ class ActiveState:
 
 
 # =============================================================================
-# Video Buffer Manager
+# Video Stream Manager
 # =============================================================================
+class VideoStreamManager:
+    def __init__(self, settings: Settings):
+        self._settings = settings
+        self._clients: set[asyncio.Queue] = set()
+        self._stream_task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
+
+    async def add_client(self) -> asyncio.Queue:
+        queue = asyncio.Queue(maxsize=10)
+        async with self._lock:
+            self._clients.add(queue)
+            if not self._stream_task or self._stream_task.done():
+                self._stream_task = asyncio.create_task(self._stream_from_camera())
+        return queue
+
+    async def remove_client(self, queue: asyncio.Queue):
+        async with self._lock:
+            self._clients.discard(queue)
+            if not self._clients and self._stream_task:
+                self._stream_task.cancel()
+
+    async def _stream_from_camera(self):
+        url = f"http://{self._settings.AXIS_USERNAME}:{self._settings.AXIS_PASSWORD}@{self._settings.AXIS_HOSTNAME}/axis-cgi/mjpg/video.cgi"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes():
+                        # Send to all connected clients
+                        dead_clients = set()
+                        for queue in self._clients.copy():
+                            try:
+                                queue.put_nowait(chunk)
+                            except asyncio.QueueFull:
+                                dead_clients.add(queue)
+                        
+                        # Remove dead clients
+                        if dead_clients:
+                            async with self._lock:
+                                self._clients -= dead_clients
+                                
+        except Exception as e:
+            logger.debug(f"Camera stream error: {e}")
+
+
 class VideoBufferManager:
     def __init__(self, settings: Settings, active_state: ActiveState):
         self._settings = settings
@@ -632,8 +693,10 @@ async def proxy_video_endpoint(request):
                     response.raise_for_status()
                     async for chunk in response.aiter_bytes():
                         yield chunk
-        except (httpx.StreamClosed, httpx.ConnectError, Exception) as e:
-            logger.debug(f"Video stream ended: {e}")
+        except (httpx.StreamClosed, httpx.ConnectError, asyncio.CancelledError):
+            return
+        except Exception as e:
+            logger.error(f"Video stream error: {e}")
             return
     
     return StreamingResponse(
@@ -641,8 +704,7 @@ async def proxy_video_endpoint(request):
         media_type="multipart/x-mixed-replace; boundary=myboundary",
         headers={
             "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Connection": "close"
+            "Pragma": "no-cache"
         }
     )
 
@@ -662,13 +724,11 @@ routes = [
 event_bus = EventBus()
 active_state = ActiveState(event_bus, settings.ACTIVE_TIMEOUT)
 camera_fetcher = CameraFetcher(settings, active_state)
-video_buffer = VideoBufferManager(settings)
+video_stream = VideoStreamManager(settings)
 udp_server = UDPServer(settings, active_state, event_bus)
 gpio_manager: GPIOManager | None = None 
 
 event_bus.subscribe("BELL_PRESSED", active_state.handle_bell_pressed)
-event_bus.subscribe("ACTIVE_STARTED", video_buffer.start_buffering)
-event_bus.subscribe("ACTIVE_ENDED", video_buffer.stop_buffering)
 
 @asynccontextmanager
 async def lifespan(app: Starlette):
