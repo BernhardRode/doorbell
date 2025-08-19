@@ -99,12 +99,25 @@ settings = Settings()
 # =============================================================================
 # Logging
 # =============================================================================
+class SanitizeFilter(logging.Filter):
+    def filter(self, record):
+        if hasattr(record, 'msg'):
+            # Replace credentials in URLs
+            record.msg = str(record.msg).replace(f"{settings.AXIS_USERNAME}:{settings.AXIS_PASSWORD}@", "***:***@")
+        return True
+
 # --- MODIFICATION: Added force=True to ensure this config takes precedence.
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     force=True,
 )
+
+# Add sanitize filter to all loggers
+for logger_name in ['doorbell', 'httpx', 'uvicorn.access', 'uvicorn.error']:
+    logger_obj = logging.getLogger(logger_name)
+    logger_obj.addFilter(SanitizeFilter())
+
 logger = logging.getLogger("doorbell")
 START_TIME = time.time()
 
@@ -192,8 +205,165 @@ class ActiveState:
 
 
 # =============================================================================
-# Camera Fetcher with Lazy Cache
+# Video Buffer Manager
 # =============================================================================
+class VideoBufferManager:
+    def __init__(self, settings: Settings, active_state: ActiveState):
+        self._settings = settings
+        self._active_state = active_state
+        self._buffer: list[bytes] = []
+        self._buffer_lock = asyncio.Lock()
+        self._stream_task: asyncio.Task | None = None
+        self._client: httpx.AsyncClient | None = None
+        self._url = f"http://{self._settings.AXIS_HOSTNAME}/axis-cgi/mjpg/video.cgi"
+        self._max_buffer_size = 50  # Keep last 50 frames
+
+    async def startup(self):
+        self._client = httpx.AsyncClient(timeout=30.0)
+
+    async def shutdown(self):
+        await self.stop_buffering()
+        if self._client:
+            await self._client.aclose()
+
+    async def start_buffering(self):
+        """Start buffering video stream"""
+        if self._stream_task and not self._stream_task.done():
+            return
+        logger.info("Starting video buffering")
+        self._stream_task = asyncio.create_task(self._buffer_stream())
+
+    async def stop_buffering(self):
+        """Stop buffering and clear buffer"""
+        if self._stream_task:
+            self._stream_task.cancel()
+            try:
+                await self._stream_task
+            except asyncio.CancelledError:
+                pass
+        async with self._buffer_lock:
+            self._buffer.clear()
+        logger.info("Stopped video buffering")
+
+    async def get_buffered_stream(self):
+        """Return buffered frames as async generator"""
+        async with self._buffer_lock:
+            buffer_copy = self._buffer.copy()
+        
+        for frame in buffer_copy:
+            yield frame
+
+    async def _buffer_stream(self):
+        """Buffer incoming video stream"""
+        try:
+            async with self._client.stream("GET", self._url) as response:
+                response.raise_for_status()
+                boundary = self._extract_boundary(response.headers.get("content-type", ""))
+                
+                buffer = b""
+                async for chunk in response.aiter_bytes():
+                    buffer += chunk
+                    frames = self._parse_mjpeg_frames(buffer, boundary)
+                    
+                    for frame in frames:
+                        async with self._buffer_lock:
+                            self._buffer.append(frame)
+                            if len(self._buffer) > self._max_buffer_size:
+                                self._buffer.pop(0)
+                    
+                    # Keep only unparsed data
+                    if frames:
+                        buffer = buffer.split(boundary.encode())[-1]
+                        
+        except Exception as e:
+            logger.error(f"Video buffering error: {e}")
+
+    def _extract_boundary(self, content_type: str) -> str:
+        """Extract boundary from content-type header"""
+        if "boundary=" in content_type:
+            return "--" + content_type.split("boundary=")[1].split(";")[0]
+        return "--myboundary"
+
+    def _parse_mjpeg_frames(self, buffer: bytes, boundary: str) -> list[bytes]:
+        """Parse MJPEG frames from buffer"""
+        frames = []
+        parts = buffer.split(boundary.encode())
+        
+        for part in parts[1:-1]:  # Skip first empty and last incomplete
+            if b"\r\n\r\n" in part:
+                frame_data = part.split(b"\r\n\r\n", 1)[1]
+                if frame_data.startswith(b"\xff\xd8"):  # JPEG header
+                    frames.append(boundary.encode() + b"\r\n" + part + b"\r\n")
+        
+        return frames
+# =============================================================================
+# Video Buffer Manager
+# =============================================================================
+class VideoBufferManager:
+    def __init__(self, settings: Settings):
+        self._settings = settings
+        self._buffer = b""
+        self._lock = asyncio.Lock()
+        self._buffering = False
+
+    async def start_buffering(self):
+        if self._buffering:
+            return
+        self._buffering = True
+        logger.info("Starting video buffering")
+        asyncio.create_task(self._capture_stream())
+
+    async def stop_buffering(self):
+        self._buffering = False
+        async with self._lock:
+            self._buffer = b""
+        logger.info("Stopped video buffering")
+
+    async def get_stream(self):
+        """Stream buffered content then live stream"""
+        # First yield buffered content if available
+        async with self._lock:
+            if self._buffer:
+                yield self._buffer
+        
+        # Always stream live regardless of buffering state
+        url = f"http://{self._settings.AXIS_USERNAME}:{self._settings.AXIS_PASSWORD}@{self._settings.AXIS_HOSTNAME}/axis-cgi/mjpg/video.cgi"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            async with client.stream("GET", url) as response:
+                async for chunk in response.aiter_bytes():
+                    # Also buffer if we're in buffering mode
+                    if self._buffering:
+                        async with self._lock:
+                            self._buffer += chunk
+                            if len(self._buffer) > 1024 * 1024:  # 1MB max
+                                self._buffer = self._buffer[-512 * 1024:]  # Keep last 512KB
+                    yield chunk
+
+    async def _capture_stream(self):
+        url = f"http://{self._settings.AXIS_USERNAME}:{self._settings.AXIS_PASSWORD}@{self._settings.AXIS_HOSTNAME}/axis-cgi/mjpg/video.cgi"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                async with client.stream("GET", url) as response:
+                    buffer_size = 0
+                    max_buffer = 1024 * 1024  # 1MB buffer
+                    
+                    async for chunk in response.aiter_bytes():
+                        if not self._buffering:
+                            break
+                            
+                        async with self._lock:
+                            self._buffer += chunk
+                            buffer_size += len(chunk)
+                            
+                            # Keep buffer size manageable
+                            if buffer_size > max_buffer:
+                                self._buffer = self._buffer[-max_buffer//2:]
+                                buffer_size = len(self._buffer)
+                                
+        except Exception as e:
+            logger.error(f"Video capture error: {e}")
+
+
 class CameraFetcher:
     def __init__(self, settings: Settings, active_state: ActiveState):
         self._settings = settings
@@ -202,15 +372,13 @@ class CameraFetcher:
         self._image: bytes | None = None
         self._last_fetch_time: float = 0.0
         self._client: httpx.AsyncClient | None = None
-        self._url = f"http://{self._settings.AXIS_HOSTNAME}/axis-cgi/jpg/image.cgi?camera=1"
+        self._url = f"http://{self._settings.AXIS_USERNAME}:{self._settings.AXIS_PASSWORD}@{self._settings.AXIS_HOSTNAME}/axis-cgi/jpg/image.cgi?camera=1"
         self._fetch_task: asyncio.Task | None = None
 
     async def startup(self):
         logger.info("Initializing camera client")
-        self._client = httpx.AsyncClient(
-            auth=(self._settings.AXIS_USERNAME, self._settings.AXIS_PASSWORD),
-            timeout=5.0
-        )
+        self._client = httpx.AsyncClient(timeout=5.0)
+        self._url = f"http://{self._settings.AXIS_USERNAME}:{self._settings.AXIS_PASSWORD}@{self._settings.AXIS_HOSTNAME}/axis-cgi/jpg/image.cgi?camera=1"
         # Start background fetching
         self._fetch_task = asyncio.create_task(self._background_fetch_loop())
 
@@ -455,25 +623,28 @@ async def get_lazy_image_endpoint(request):
         return JSONResponse({"error": "No cached image available"}, status_code=503)
 
 async def proxy_video_endpoint(request):
-    url = f"http://{settings.AXIS_HOSTNAME}/axis-cgi/mjpg/video.cgi"
-    try:
-        async with httpx.AsyncClient() as client:
-            req = client.build_request("GET", url, auth=(settings.AXIS_USERNAME, settings.AXIS_PASSWORD))
-            upstream_resp = await client.send(req, stream=True)
-            upstream_resp.raise_for_status()
-            
-            headers = {k: v for k, v in upstream_resp.headers.items()
-                       if k.lower() not in ("content-encoding", "transfer-encoding", "connection")}
-            
-            return StreamingResponse(
-                upstream_resp.aiter_bytes(),
-                status_code=upstream_resp.status_code,
-                headers=headers,
-                media_type=upstream_resp.headers.get("content-type")
-            )
-    except Exception as e:
-        logger.error(f"Proxy video error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=502)
+    url = f"http://{settings.AXIS_USERNAME}:{settings.AXIS_PASSWORD}@{settings.AXIS_HOSTNAME}/axis-cgi/mjpg/video.cgi"
+    
+    async def stream_generator():
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+        except (httpx.StreamClosed, httpx.ConnectError, Exception) as e:
+            logger.debug(f"Video stream ended: {e}")
+            return
+    
+    return StreamingResponse(
+        stream_generator(),
+        media_type="multipart/x-mixed-replace; boundary=myboundary",
+        headers={
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Connection": "close"
+        }
+    )
 
 async def healthz_endpoint(request):
     return PlainTextResponse("ok")
@@ -491,10 +662,13 @@ routes = [
 event_bus = EventBus()
 active_state = ActiveState(event_bus, settings.ACTIVE_TIMEOUT)
 camera_fetcher = CameraFetcher(settings, active_state)
+video_buffer = VideoBufferManager(settings)
 udp_server = UDPServer(settings, active_state, event_bus)
 gpio_manager: GPIOManager | None = None 
 
 event_bus.subscribe("BELL_PRESSED", active_state.handle_bell_pressed)
+event_bus.subscribe("ACTIVE_STARTED", video_buffer.start_buffering)
+event_bus.subscribe("ACTIVE_ENDED", video_buffer.stop_buffering)
 
 @asynccontextmanager
 async def lifespan(app: Starlette):
