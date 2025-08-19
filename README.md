@@ -8,7 +8,7 @@ A Raspberry Pi doorbell system with SIP calling capabilities, video streaming, a
 
 ```bash
 # Install and run directly from GitHub
-uvx bernhardrode/doorbell
+uvx --from git+https://github.com/bernhardrode/doorbell doorbell
 
 # Or install from PyPI (when published)
 uvx doorbell
