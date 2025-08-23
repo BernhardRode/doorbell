@@ -52,6 +52,7 @@ import json
 import logging
 import os
 import re
+import signal
 import socket
 import sys
 import threading
@@ -66,6 +67,8 @@ from starlette.applications import Starlette
 from starlette.responses import (JSONResponse, PlainTextResponse, Response,
                                  StreamingResponse)
 from starlette.routing import Route
+
+from pysip_server import SIPServer
 
 # --- GPIO import (optionally stubbed for non-Pi dev) --------------------------
 GPIO_FAKE = os.environ.get("GPIO_FAKE", "0") == "1"
@@ -157,6 +160,10 @@ class Settings:
         object.__setattr__(self, 'UDP_BCAST_PORT', int(os.environ.get("UDP_BCAST_PORT", config.get("udp_bcast_port", "9999"))))
         object.__setattr__(self, 'UDP_BCAST_INTERVAL', int(os.environ.get("UDP_BCAST_SECS", config.get("udp_bcast_interval", "5"))))
         object.__setattr__(self, 'LOG_LEVEL', os.environ.get("LOG_LEVEL", config.get("log_level", "INFO")).upper())
+        object.__setattr__(self, 'LOG_FILE', os.environ.get("LOG_FILE", config.get("log_file", None)))
+        print(f"DEBUG: LOG_FILE from env: {os.environ.get("LOG_FILE")}")
+        print(f"DEBUG: LOG_FILE from config: {config.get("log_file")}")
+        print(f"DEBUG: Final LOG_FILE setting: {self.LOG_FILE}")
         
         # SIP Configuration
         object.__setattr__(self, 'SIP_PORT', int(os.environ.get("SIP_PORT", config.get("sip_port", "5060"))))
@@ -182,12 +189,17 @@ class LogFormatter(logging.Formatter):
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    force=True,
 )
 
 # Apply custom formatter to all handlers
 for handler in logging.getLogger().handlers:
     handler.setFormatter(LogFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
+# --- NEW: Add file handler if LOG_FILE is specified
+if settings.LOG_FILE:
+    file_handler = logging.FileHandler(settings.LOG_FILE)
+    file_handler.setFormatter(LogFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logging.getLogger().addHandler(file_handler)
 
 logger = logging.getLogger("doorbell")
 START_TIME = time.time()
@@ -225,16 +237,11 @@ class ActiveState:
         self._lock = asyncio.Lock()
         self._is_active = False
         self._activated_at = 0.0
-        self._sip_server: 'SIPServer | None' = None
-
-    def set_sip_server(self, sip_server: 'SIPServer'):
-        """Set reference to SIP server for call state checking"""
-        self._sip_server = sip_server
 
     @property
     def is_active(self) -> bool: 
         # Stay active if there's an ongoing call
-        if self._sip_server and self._sip_server.is_call_active:
+        if sip_server and sip_server.is_call_active:
             return True
         return self._is_active
     
@@ -288,245 +295,7 @@ class ActiveState:
             self._is_active = False
 
 
-# =============================================================================
-# SIP Server
-# =============================================================================
-@dataclass
-class CallState:
-    state: str = "idle"  # idle, ringing, active, ended
-    call_id: str | None = None
-    remote_addr: tuple | None = None
-    start_time: float = 0.0
-    answer_time: float = 0.0
 
-class SIPServer:
-    def __init__(self, settings: Settings, event_bus: EventBus):
-        self._settings = settings
-        self._event_bus = event_bus
-        self._transport: asyncio.DatagramTransport | None = None
-        self._call = CallState()
-        self._auto_answer_task: asyncio.Task | None = None
-        self._call_timeout_task: asyncio.Task | None = None
-        self._log = logging.getLogger("doorbell.sip")
-
-    @property
-    def call_state(self) -> str:
-        return self._call.state
-
-    @property
-    def is_call_active(self) -> bool:
-        return self._settings.SIP_ENABLED and self._call.state in ("ringing", "active")
-
-    async def start(self, loop: asyncio.AbstractEventLoop):
-        if not self._settings.SIP_ENABLED:
-            self._log.info("SIP server disabled")
-            return
-        
-        try:
-            self._transport, _ = await loop.create_datagram_endpoint(
-                lambda: self._SIPProtocol(self),
-                local_addr=("0.0.0.0", self._settings.SIP_PORT)
-            )
-            self._log.info(f"SIP server listening on port {self._settings.SIP_PORT}")
-        except Exception as e:
-            self._log.error(f"Failed to start SIP server: {e}")
-            # Don't fail the entire app if SIP fails
-            pass
-
-    async def stop(self):
-        await self._end_call("shutdown")
-        if self._transport:
-            self._transport.close()
-            self._log.info("SIP server stopped")
-
-    def _parse_sip_message(self, data: bytes) -> dict:
-        """Parse basic SIP message"""
-        lines = data.decode().strip().split('\r\n')
-        if not lines:
-            return {}
-            
-        # Parse request line
-        request_line = lines[0].split()
-        if len(request_line) < 3:
-            return {}
-            
-        headers = {}
-        for line in lines[1:]:
-            if ':' in line:
-                key, value = line.split(':', 1)
-                headers[key.strip().lower()] = value.strip()
-                
-        return {
-            'method': request_line[0],
-            'uri': request_line[1],
-            'version': request_line[2],
-            'headers': headers
-        }
-
-    def _create_response(self, code: int, reason: str, call_id: str, headers: dict = None) -> bytes:
-        """Create SIP response"""
-        response = f"SIP/2.0 {code} {reason}\r\n"
-        response += f"Call-ID: {call_id}\r\n"
-        response += f"Via: {headers.get('via', '')}\r\n"
-        response += f"From: {headers.get('from', '')}\r\n"
-        response += f"To: {headers.get('to', '')}\r\n"
-        response += f"CSeq: {headers.get('cseq', '')}\r\n"
-        response += "Content-Length: 0\r\n\r\n"
-        return response.encode()
-
-    async def _handle_invite(self, msg: dict, addr: tuple):
-        """Handle incoming INVITE (call request)"""
-        call_id = msg['headers'].get('call-id', '')
-        
-        if self._call.state != "idle":
-            # Send busy
-            response = self._create_response(486, "Busy Here", call_id, msg['headers'])
-            self._transport.sendto(response, addr)
-            self._log.info(f"Rejected call from {addr} - busy")
-            return
-            
-        # Accept the call
-        self._call.state = "ringing"
-        self._call.call_id = call_id
-        self._call.remote_addr = addr
-        self._call.start_time = time.time()
-        
-        # Send 100 Trying
-        response = self._create_response(100, "Trying", call_id, msg['headers'])
-        self._transport.sendto(response, addr)
-        
-        # Send 180 Ringing
-        response = self._create_response(180, "Ringing", call_id, msg['headers'])
-        self._transport.sendto(response, addr)
-        
-        self._log.info(f"Incoming call from {addr}")
-        await self._event_bus.emit("SIP_CALL_INCOMING", addr)
-        
-        # Auto-answer after 3 seconds
-        self._auto_answer_task = asyncio.create_task(self._auto_answer_call(call_id, addr, msg['headers']))
-        
-        # Set call timeout (60 seconds total)
-        self._call_timeout_task = asyncio.create_task(self._call_timeout(call_id))
-
-    async def _auto_answer_call(self, call_id: str, addr: tuple, headers: dict):
-        """Auto-answer call after delay"""
-        try:
-            await asyncio.sleep(3)
-            if self._call.state == "ringing" and self._call.call_id == call_id:
-                await self._answer_call(call_id, addr, headers)
-        except asyncio.CancelledError:
-            pass
-
-    async def _answer_call(self, call_id: str, addr: tuple, headers: dict):
-        """Answer the call"""
-        self._call.state = "active"
-        self._call.answer_time = time.time()
-        
-        # Send 200 OK
-        response = self._create_response(200, "OK", call_id, headers)
-        self._transport.sendto(response, addr)
-        
-        self._log.info(f"Call answered with {addr}")
-        await self._event_bus.emit("SIP_CALL_ANSWERED", addr)
-
-    async def _handle_bye(self, msg: dict, addr: tuple):
-        """Handle call termination"""
-        call_id = msg['headers'].get('call-id', '')
-        
-        if self._call.call_id == call_id:
-            response = self._create_response(200, "OK", call_id, msg['headers'])
-            self._transport.sendto(response, addr)
-            
-            await self._end_call("remote_hangup")
-            self._log.info(f"Call ended by {addr}")
-
-    async def _call_timeout(self, call_id: str):
-        """Handle call timeout (60 seconds)"""
-        try:
-            await asyncio.sleep(60)
-            if self._call.call_id == call_id and self._call.state in ("ringing", "active"):
-                await self._end_call("timeout")
-                self._log.info("Call timed out")
-        except asyncio.CancelledError:
-            pass
-
-    async def _end_call(self, reason: str):
-        """End current call and cleanup"""
-        if self._call.state == "idle":
-            return
-            
-        # Cancel any pending tasks
-        if self._auto_answer_task:
-            self._auto_answer_task.cancel()
-            self._auto_answer_task = None
-            
-        if self._call_timeout_task:
-            self._call_timeout_task.cancel()
-            self._call_timeout_task = None
-        
-        # Send BYE if we're ending the call
-        if reason in ("timeout", "hangup") and self._call.remote_addr:
-            bye_msg = f"BYE sip:{self._settings.SIP_USER}@{self._settings.SIP_DOMAIN} SIP/2.0\r\n"
-            bye_msg += f"Call-ID: {self._call.call_id}\r\n"
-            bye_msg += "Content-Length: 0\r\n\r\n"
-            self._transport.sendto(bye_msg.encode(), self._call.remote_addr)
-        
-        old_state = self._call.state
-        remote_addr = self._call.remote_addr
-        
-        # Reset call state
-        self._call = CallState()
-        
-        await self._event_bus.emit("SIP_CALL_ENDED", {"reason": reason, "addr": remote_addr, "was_active": old_state == "active"})
-
-    async def hangup_call(self):
-        """Manually hang up current call"""
-        if self._call.state != "idle":
-            await self._end_call("hangup")
-            self._log.info("Call manually hung up")
-
-    def get_call_info(self) -> dict:
-        """Get current call information"""
-        if not self._settings.SIP_ENABLED:
-            return {"enabled": False}
-            
-        return {
-            "enabled": True,
-            "state": self._call.state,
-            "active": self.is_call_active,
-            "duration": time.time() - self._call.answer_time if self._call.answer_time > 0 else 0
-        }
-
-    class _SIPProtocol(asyncio.DatagramProtocol):
-        def __init__(self, server: 'SIPServer'):
-            self.server = server
-
-        def connection_made(self, transport: asyncio.BaseTransport):
-            self.transport = transport
-
-        def datagram_received(self, data: bytes, addr: tuple):
-            asyncio.create_task(self.server._handle_message(data, addr))
-
-    async def _handle_message(self, data: bytes, addr: tuple):
-        """Handle incoming SIP message"""
-        try:
-            msg = self._parse_sip_message(data)
-            if not msg:
-                return
-                
-            method = msg.get('method', '')
-            self._log.debug(f"SIP {method} from {addr}")
-            
-            if method == "INVITE":
-                await self._handle_invite(msg, addr)
-            elif method == "BYE":
-                await self._handle_bye(msg, addr)
-            elif method == "ACK":
-                # ACK for 200 OK - call is established
-                pass
-                
-        except Exception as e:
-            self._log.error(f"SIP message error: {e}")
 
 
 # =============================================================================
@@ -832,7 +601,17 @@ class GPIOManager:
         if self._thread:
             self._stop_polling.set()
             self._thread.join(timeout=1.0)
-        self.led_off() # Ensure LED is off on shutdown
+        
+        # Ensure LED is off before cleanup
+        try:
+            self.led_off()
+            logger.info("LED turned off before shutdown")
+            # Give a small delay to ensure the GPIO state is set
+            import time
+            time.sleep(0.1)
+        except Exception as e:
+            logger.warning(f"Failed to turn off LED during shutdown: {e}")
+        
         GPIO.cleanup()
         logger.info("GPIO cleanup complete")
 
@@ -948,6 +727,29 @@ class UDPServer:
         else:
             transport.sendto(b"ERR unknown command", addr)
 
+    async def broadcast_button_press(self, button_id: int):
+        """Broadcast a UDP message when a button is pressed"""
+        if not self._settings.UDP_BROADCAST_ENABLED:
+            return
+            
+        log = logging.getLogger("doorbell.udp.broadcast")
+        addr = (self._settings.UDP_BCAST_ADDR, self._settings.UDP_BCAST_PORT)
+        
+        payload = json.dumps({
+            "type": "doorbell_button_press",
+            "button_id": button_id,
+            "timestamp": time.time(),
+            "active": self._active_state.is_active
+        }).encode()
+        
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.sendto(payload, addr)
+                log.info(f"Broadcasted button {button_id} press to {addr[0]}:{addr[1]}")
+        except Exception as e:
+            log.warning(f"Button press broadcast failed: {e}")
+
     async def _broadcast_loop(self):
         log = logging.getLogger("doorbell.udp.broadcast")
         addr = (self._settings.UDP_BCAST_ADDR, self._settings.UDP_BCAST_PORT)
@@ -1021,9 +823,7 @@ async def proxy_video_endpoint(request):
         }
     )
 
-async def sip_hangup_endpoint(request):
-    await sip_server.hangup_call()
-    return JSONResponse({"status": "call ended"})
+
 
 async def healthz_endpoint(request):
     return PlainTextResponse("ok")
@@ -1032,13 +832,32 @@ routes = [
     Route("/status", get_status_endpoint),
     Route("/image", get_lazy_image_endpoint),
     Route("/video", proxy_video_endpoint),
-    Route("/sip/hangup", sip_hangup_endpoint, methods=["POST"]),
     Route("/healthz", healthz_endpoint),
 ]
 
 # =============================================================================
 # App Initialization & Lifespan
 # =============================================================================
+
+# Global reference for signal handler
+gpio_manager_global = None
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals to ensure LED is turned off"""
+    logger.info(f"Received signal {signum}, forcing immediate exit...")
+    if gpio_manager_global:
+        try:
+            gpio_manager_global.led_off()
+            logger.info("LED turned off via signal handler")
+        except Exception as e:
+            logger.warning(f"Failed to turn off LED in signal handler: {e}")
+    print("Exiting now...")
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
 event_bus = EventBus()
 active_state = ActiveState(event_bus, settings.ACTIVE_TIMEOUT)
 camera_fetcher = CameraFetcher(settings, active_state)
@@ -1048,17 +867,19 @@ sip_server = SIPServer(settings, event_bus)
 gpio_manager: GPIOManager | None = None
 
 # Link active state with SIP server
-active_state.set_sip_server(sip_server) 
+ 
 
 event_bus.subscribe("BELL_PRESSED", active_state.handle_bell_pressed)
+event_bus.subscribe("BELL_PRESSED", udp_server.broadcast_button_press)
 
 @asynccontextmanager
 async def lifespan(app: Starlette):
-    global gpio_manager
+    global gpio_manager, gpio_manager_global
     loop = asyncio.get_running_loop()
     
     logger.info("Application starting...")
     gpio_manager = GPIOManager(settings, event_bus, loop)
+    gpio_manager_global = gpio_manager  # Set global reference for signal handler
     event_bus.subscribe("ACTIVE_STARTED", gpio_manager.led_on_async)
     event_bus.subscribe("ACTIVE_ENDED", gpio_manager.led_off_async)
     

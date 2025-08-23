@@ -47,6 +47,18 @@ sudo journalctl -u doorbell -f
 sudo doorbell-uninstall-service
 ```
 
+### Makefile Installation (for service)
+
+If you have `make` installed, you can use the following commands to install or uninstall the systemd service:
+
+```bash
+# Install the service
+make install
+
+# Uninstall the service
+make uninstall
+```
+
 ## Configuration
 
 Create a config file at `~/.config/doorbell.json`:
@@ -114,12 +126,9 @@ doorbell
 git clone https://github.com/bernhardrode/doorbell.git
 cd doorbell
 
-# Install in development mode
-pip install -e ".[dev]"
-
 # Run tests
-python -m doorbell.test_doorbell
-python -m doorbell.test_sip_client
+source .venv/bin/activate
+uv run doorbell
 ```
 
 ## License

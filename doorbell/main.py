@@ -31,12 +31,12 @@ Environment variables:
 """
 from __future__ import annotations
 
-import logging
-import re
+import audioop
 
 # =============================================================================
 # Credential Sanitization (MUST BE FIRST)
 # =============================================================================
+import logging
 class SanitizeFilter(logging.Filter):
     def filter(self, record):
         if hasattr(record, 'msg'):
@@ -49,7 +49,6 @@ logging.getLogger().addFilter(SanitizeFilter())
 
 import asyncio
 import json
-import logging
 import os
 import re
 import socket
@@ -58,6 +57,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Dict, Optional
 from pathlib import Path
 from typing import Awaitable, Callable, List
 
@@ -66,6 +66,18 @@ from starlette.applications import Starlette
 from starlette.responses import (JSONResponse, PlainTextResponse, Response,
                                  StreamingResponse)
 from starlette.routing import Route
+
+# Import PySIP server
+try:
+    from .pysip_server import PySIPServer
+    PYSIP_AVAILABLE = True
+except ImportError:
+    try:
+        from pysip_server import PySIPServer
+        PYSIP_AVAILABLE = True
+    except ImportError:
+        PYSIP_AVAILABLE = False
+        PySIPServer = None
 
 try:
     import pyaudio
@@ -99,6 +111,19 @@ except (ImportError, RuntimeError):
 # =============================================================================
 # Configuration
 # =============================================================================
+def get_local_ip_address() -> str:
+    """Get the local IP address of the machine."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # doesn't even have to be reachable
+        s.connect(('10.255.255.255', 1))
+        ip_address = s.getsockname()[0]
+    except Exception:
+        ip_address = socket.gethostbyname(socket.gethostname())
+    finally:
+        s.close()
+    return ip_address
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -163,6 +188,10 @@ class Settings:
         object.__setattr__(self, 'UDP_BCAST_PORT', int(os.environ.get("UDP_BCAST_PORT", config.get("udp_bcast_port", "9999"))))
         object.__setattr__(self, 'UDP_BCAST_INTERVAL', int(os.environ.get("UDP_BCAST_SECS", config.get("udp_bcast_interval", "5"))))
         object.__setattr__(self, 'LOG_LEVEL', os.environ.get("LOG_LEVEL", config.get("log_level", "INFO")).upper())
+        object.__setattr__(self, 'LOG_FILE', os.environ.get("LOG_FILE", config.get("log_file", None)))
+        
+        # HTTP Configuration
+        object.__setattr__(self, 'HTTP_PORT', int(os.environ.get("HTTP_PORT", config.get("http_port", "8000"))))
         
         # SIP Configuration
         object.__setattr__(self, 'SIP_PORT', int(os.environ.get("SIP_PORT", config.get("sip_port", "5060"))))
@@ -197,6 +226,12 @@ logging.basicConfig(
 for handler in logging.getLogger().handlers:
     handler.setFormatter(LogFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 
+# --- NEW: Add file handler if LOG_FILE is specified
+if settings.LOG_FILE:
+    file_handler = logging.FileHandler(settings.LOG_FILE)
+    file_handler.setFormatter(LogFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logging.getLogger().addHandler(file_handler)
+
 logger = logging.getLogger("doorbell")
 START_TIME = time.time()
 
@@ -209,6 +244,7 @@ class AudioManager:
         self._settings = settings
         self._audio = None
         self._stream = None
+        self._sample_rate = 8000  # Default, will be updated during initialization
         self._log = logging.getLogger("doorbell.audio")
         
     async def startup(self):
@@ -218,25 +254,55 @@ class AudioManager:
             
         try:
             self._audio = pyaudio.PyAudio()
-            # Setup audio stream for playback
-            self._stream = self._audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=8000,  # Standard for G.711
-                output=True,
-                frames_per_buffer=160  # 20ms at 8kHz
-            )
-            self._log.info("Audio system initialized")
+            
+            # Find a suitable output device
+            output_device = None
+            for i in range(self._audio.get_device_count()):
+                device_info = self._audio.get_device_info_by_index(i)
+                if device_info['maxOutputChannels'] > 0:
+                    self._log.info(f"Found audio output device: {device_info['name']}")
+                    if output_device is None:  # Use first available output device
+                        output_device = i
+                        break
+            
+            # Setup audio stream for playback - try multiple sample rates
+            sample_rates = [8000, 16000, 22050, 44100, 48000]  # G.711 first, then common rates
+            
+            for rate in sample_rates:
+                try:
+                    self._stream = self._audio.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=rate,
+                        output=True,
+                        output_device_index=output_device,
+                        frames_per_buffer=int(rate * 0.02)  # 20ms buffer
+                    )
+                    self._sample_rate = rate
+                    self._log.info(f"Audio initialized at {rate}Hz")
+                    break
+                except Exception as e:
+                    self._log.debug(f"Failed to initialize audio at {rate}Hz: {e}")
+                    continue
+            else:
+                raise Exception("No supported sample rate found")
+            self._log.info(f"Audio system initialized with device {output_device}")
         except Exception as e:
             self._log.error(f"Failed to initialize audio: {e}")
+            self._audio = None
+            self._stream = None
             
     async def play_audio(self, audio_data: bytes):
         """Play audio data to speaker"""
-        if self._stream:
+        if self._stream and self._audio:
             try:
-                self._stream.write(audio_data)
+                # Convert G.711 u-law to 16-bit PCM
+                pcm_data = audioop.ulaw2lin(audio_data, 2)
+                self._stream.write(pcm_data)
             except Exception as e:
                 self._log.error(f"Audio playback error: {e}")
+        else:
+            self._log.debug("Audio stream not available for playback")
                 
     async def shutdown(self):
         if self._stream:
@@ -341,16 +407,23 @@ class ActiveState:
             self._is_active = False
 
 
-# =============================================================================
-# SIP Server
-# =============================================================================
+
+
+# CallState class for SIP server
 @dataclass
 class CallState:
     state: str = "idle"  # idle, ringing, active, ended
-    call_id: str | None = None
+    call_id: str = ""
     remote_addr: tuple | None = None
     start_time: float = 0.0
     answer_time: float = 0.0
+    flat_id: str = ""  # Identifier for the flat
+    rtp_port: int = 0
+    rtp_socket: socket.socket | None = None
+    rtp_task: asyncio.Task | None = None
+    timeout_task: asyncio.Task | None = None
+    rtp_timeout_task: asyncio.Task | None = None
+    last_rtp_time: float = 0.0
 
 class SIPServer:
     def __init__(self, settings: Settings, event_bus: EventBus, audio_manager: 'AudioManager'):
@@ -358,7 +431,16 @@ class SIPServer:
         self._event_bus = event_bus
         self._audio_manager = audio_manager
         self._transport: asyncio.DatagramTransport | None = None
-        self._call = CallState()
+        # Multi-call support
+        self._active_calls: Dict[str, CallState] = {}
+        self._flat_calls: Dict[str, str] = {}
+        # Configuration for flats
+        self._allowed_flats = {
+            "flat1": {"user": "flat1", "display_name": "Flat 1", "ip_pattern": ".101"},
+            "flat2": {"user": "flat2", "display_name": "Flat 2", "ip_pattern": ".102"},
+            "flat3": {"user": "flat3", "display_name": "Flat 3", "ip_pattern": ".103"},
+            "loxone": {"user": "smarthome", "display_name": "Loxone System", "ip_pattern": ".213"}
+        }
         self._auto_answer_task: asyncio.Task | None = None
         self._call_timeout_task: asyncio.Task | None = None
         self._rtp_socket: socket.socket | None = None
@@ -367,11 +449,41 @@ class SIPServer:
 
     @property
     def call_state(self) -> str:
-        return self._call.state
+        # Return state of first active call, or "idle" if none
+        for call in self._active_calls.values():
+            if call.state != "idle":
+                return call.state
+        return "idle"
+
+    def _identify_flat(self, msg: dict, addr: tuple) -> str:
+        """Identify which flat is calling based on SIP headers and IP"""
+        # Try to extract flat ID from From header
+        from_header = msg['headers'].get('from', '').lower()
+        
+        # Look for flat identifiers in the From header
+        for flat_id, config in self._allowed_flats.items():
+            if config['user'].lower() in from_header:
+                self._log.info(f"Identified {flat_id} by SIP user: {config['user']}")
+                return flat_id
+                
+        # Fallback: use IP address to identify flat
+        ip = addr[0]
+        for flat_id, config in self._allowed_flats.items():
+            if config['ip_pattern'] in ip:
+                self._log.info(f"Identified {flat_id} by IP pattern: {config['ip_pattern']} in {ip}")
+                return flat_id
+        
+        # Default fallback
+        fallback_id = f"unknown_{ip.replace('.', '_')}"
+        self._log.warning(f"Could not identify flat, using fallback: {fallback_id}")
+        return fallback_id
 
     @property
     def is_call_active(self) -> bool:
-        return self._settings.SIP_ENABLED and self._call.state in ("ringing", "active")
+        """Check if any call is active"""
+        return self._settings.SIP_ENABLED and any(
+            call.state in ("ringing", "active") for call in self._active_calls.values()
+        )
 
     async def start(self, loop: asyncio.AbstractEventLoop):
         if not self._settings.SIP_ENABLED:
@@ -390,9 +502,13 @@ class SIPServer:
             pass
 
     async def stop(self):
-        await self._end_call("shutdown")
+        # End all active calls
+        for call_id in list(self._active_calls.keys()):
+            await self._end_call(call_id, "shutdown")
+        
         if self._transport:
             self._transport.close()
+            self._transport = None
             self._log.info("SIP server stopped")
 
     def _parse_sip_message(self, data: bytes) -> dict:
@@ -430,78 +546,237 @@ class SIPServer:
         response += "Content-Length: 0\r\n\r\n"
         return response.encode()
 
-    async def _handle_invite(self, msg: dict, addr: tuple):
-        """Handle incoming INVITE (call request)"""
-        call_id = msg['headers'].get('call-id', '')
+    def _send_sip_message(self, message: bytes, addr: tuple, description: str = ""):
+        """Send SIP message and log it"""
+        if self._transport:
+            try:
+                # Enhanced logging with timestamp and size
+                import time
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                
+                self._log.info(f"=== OUTGOING SIP MESSAGE TO {addr} {description} ===")
+                self._log.info(f"Timestamp: {timestamp}")
+                self._log.info(f"Size: {len(message)} bytes")
+                
+                # Ensure message is properly handled for logging
+                if isinstance(message, bytes):
+                    log_message = message.decode('utf-8', errors='ignore')
+                else:
+                    log_message = str(message)
+                self._log.info(log_message)
+                self._log.info("=== END OUTGOING SIP MESSAGE ===")
+                
+                # Also log to a separate SIP-only file if needed
+                self._log_sip_message("OUTGOING", addr, log_message, description)
+                
+                self._transport.sendto(message, addr)
+            except Exception as e:
+                self._log.error(f"Failed to send SIP message to {addr}: {e}")
+                # Add traceback for debugging
+                import traceback
+                self._log.debug(f"SIP send error details: {traceback.format_exc()}")
+
+    def _log_sip_message(self, direction: str, addr: tuple, message: str, description: str = ""):
+        """Log SIP message to separate detailed log"""
+        import time
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         
-        if self._call.state != "idle":
-            # Send busy
-            response = self._create_response(486, "Busy Here", call_id, msg['headers'])
-            self._transport.sendto(response, addr)
-            self._log.info(f"Rejected call from {addr} - busy")
-            return
-            
-        # Accept the call
-        self._call.state = "ringing"
-        self._call.call_id = call_id
-        self._call.remote_addr = addr
-        self._call.start_time = time.time()
+        # You can uncomment this to write to a separate SIP log file
+        # try:
+        #     with open("/tmp/doorbell_sip.log", "a") as f:
+        #         f.write(f"\n[{timestamp}] {direction} {addr} {description}\n")
+        #         f.write(f"{message}\n")
+        #         f.write("-" * 80 + "\n")
+        # except:
+        #     pass
+        
+        # For now, just add extra detail to main log
+        self._log.debug(f"SIP {direction} {addr}: {len(message)} bytes {description}")
+
+    async def _handle_invite(self, msg: dict, addr: tuple):
+        """Handle incoming INVITE with multi-flat support"""
+        call_id = msg['headers'].get('call-id', '')
+        flat_id = self._identify_flat(msg, addr)
+        
+        self._log.info(f"INVITE from {flat_id} ({addr}) - Call ID: {call_id}")
+        
+        # Create new call state
+        call_state = CallState(
+            call_id=call_id,
+            state="ringing",
+            remote_addr=addr,
+            start_time=time.time(),
+            flat_id=flat_id
+        )
+        
+        self._active_calls[call_id] = call_state
+        self._flat_calls[flat_id] = call_id
         
         # Send 100 Trying
         response = self._create_response(100, "Trying", call_id, msg['headers'])
-        self._transport.sendto(response, addr)
+        self._send_sip_message(response, addr, f"(100 Trying - {flat_id})")
         
         # Send 180 Ringing
         response = self._create_response(180, "Ringing", call_id, msg['headers'])
-        self._transport.sendto(response, addr)
+        self._send_sip_message(response, addr, f"(180 Ringing - {flat_id})")
         
-        self._log.info(f"Incoming call from {addr}")
-        await self._event_bus.emit("SIP_CALL_INCOMING", addr)
+        self._log.info(f"Incoming call from {flat_id} ({addr})")
+        await self._event_bus.emit("SIP_CALL_INCOMING", {"flat_id": flat_id, "addr": addr})
         
         # Auto-answer after 3 seconds
-        self._auto_answer_task = asyncio.create_task(self._auto_answer_call(call_id, addr, msg['headers']))
+        asyncio.create_task(self._auto_answer_call(call_id, addr, msg['headers']))
         
         # Set call timeout (60 seconds total)
-        self._call_timeout_task = asyncio.create_task(self._call_timeout(call_id))
+        call_state.timeout_task = asyncio.create_task(self._call_timeout(call_id))
 
     async def _auto_answer_call(self, call_id: str, addr: tuple, headers: dict):
-        """Auto-answer call immediately"""
+        """Auto-answer call after 3 seconds"""
         try:
-            if self._call.state == "ringing" and self._call.call_id == call_id:
+            await asyncio.sleep(3)
+            
+            # Check if call is still ringing
+            if call_id in self._active_calls and self._active_calls[call_id].state == "ringing":
                 await self._answer_call(call_id, addr, headers)
         except asyncio.CancelledError:
             pass
 
     async def _answer_call(self, call_id: str, addr: tuple, headers: dict):
-        """Answer the call"""
-        self._call.state = "active"
-        self._call.answer_time = time.time()
+        """Answer a specific call"""
+        if call_id not in self._active_calls:
+            return
+            
+        call_state = self._active_calls[call_id]
+        call_state.state = "active"
+        call_state.answer_time = time.time()
+        call_state.last_rtp_time = time.time()
+        call_state.last_rtp_time = time.time()
         
-        # Setup RTP for audio
-        await self._setup_rtp()
+        # Setup RTP for this call
+        rtp_port = await self._setup_rtp_for_call(call_id)
+        call_state.rtp_port = rtp_port
         
-        # Send 200 OK with SDP
+        # Create SDP for audio
+        local_ip = get_local_ip_address()
         sdp = f"""v=0
-o=doorbell 0 0 IN IP4 {socket.gethostbyname(socket.gethostname())}
-s=Doorbell
-c=IN IP4 {socket.gethostbyname(socket.gethostname())}
+o=doorbell 123456 654321 IN IP4 {local_ip}
+s=Doorbell Session
+c=IN IP4 {local_ip}
 t=0 0
-m=audio {self._rtp_port} RTP/AVP 0
+m=audio {rtp_port} RTP/AVP 0
 a=rtpmap:0 PCMU/8000"""
         
         response = f"SIP/2.0 200 OK\r\n"
         response += f"Call-ID: {call_id}\r\n"
         response += f"Via: {headers.get('via', '')}\r\n"
         response += f"From: {headers.get('from', '')}\r\n"
-        response += f"To: {headers.get('to', '')}\r\n"
-        response += f"CSeq: {headers.get('cseq', '')}\r\n"
-        response += f"Content-Type: application/sdp\r\n"
+        response += f"To: {headers.get('to', '')};tag=doorbell-tag\r\n"
+        response += f"CSeq: {headers.get('cseq', '1 INVITE')}\r\n"
+        response += "Contact: <sip:door@doorbell.local>\r\n"
+        response += "Content-Type: application/sdp\r\n"
         response += f"Content-Length: {len(sdp)}\r\n\r\n{sdp}"
         
-        self._transport.sendto(response.encode(), addr)
+        self._send_sip_message(response.encode(), addr, f"(200 OK - {call_state.flat_id})")
         
-        self._log.info(f"Call answered with {addr}")
+        self._log.info(f"Call answered from {call_state.flat_id} ({addr})")
+        await self._event_bus.emit("SIP_CALL_ANSWERED", {
+            "flat_id": call_state.flat_id, 
+            "addr": addr,
+            "call_id": call_id
+        })
         await self._event_bus.emit("SIP_CALL_ANSWERED", addr)
+
+        # Start RTP timeout monitor
+        call_state.rtp_timeout_task = asyncio.create_task(self._rtp_timeout_monitor(call_id))
+
+    async def _setup_rtp_for_call(self, call_id: str) -> int:
+        """Setup RTP socket for a specific call"""
+        try:
+            if call_id not in self._active_calls:
+                return 0
+                
+            call_state = self._active_calls[call_id]
+            
+            # Create RTP socket
+            rtp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            rtp_socket.bind(('0.0.0.0', 0))  # Let system assign port
+            rtp_port = rtp_socket.getsockname()[1]
+            
+            call_state.rtp_socket = rtp_socket
+            
+            # Start RTP receiver task for this call
+            task = asyncio.create_task(self._rtp_receiver_for_call(call_id))
+            call_state.rtp_task = task
+            
+            self._log.info(f"RTP setup for {call_state.flat_id} (call {call_id}) on port {rtp_port}")
+            return rtp_port
+            
+        except Exception as e:
+            self._log.error(f"Failed to setup RTP for call {call_id}: {e}")
+            return 0
+
+    async def _rtp_receiver_for_call(self, call_id: str):
+        """Receive RTP audio for a specific call"""
+        if call_id not in self._active_calls:
+            return
+            
+        call_state = self._active_calls[call_id]
+        rtp_socket = call_state.rtp_socket
+        
+        if not rtp_socket:
+            return
+            
+        try:
+            loop = asyncio.get_event_loop()
+            
+            while call_id in self._active_calls and self._active_calls[call_id].state == "active":
+                try:
+                    try:
+                        data, addr = await asyncio.wait_for(loop.sock_recvfrom(rtp_socket, 1024), timeout=1.0)
+                        # Simple RTP parsing (skip 12-byte header)
+                        if len(data) > 12:
+                            call_state.last_rtp_time = time.time()
+                            audio_payload = data[12:]
+                            # Play audio from this flat
+                            await self._audio_manager.play_audio(audio_payload)
+
+                            # Log which flat is speaking
+                            self._log.info(f"Audio from {call_state.flat_id}: {len(audio_payload)} bytes")
+                    except asyncio.TimeoutError:
+                        continue # Go to the next iteration of the while loop
+                except Exception as e:
+                    if call_id in self._active_calls:  # Only log if call still exists
+                        self._log.error(f"RTP receive error for {call_state.flat_id}: {e}")
+                    break
+                    
+        except Exception as e:
+            self._log.error(f"RTP receiver error for call {call_id}: {e}")
+        finally:
+            # Cleanup
+            if rtp_socket:
+                try:
+                    rtp_socket.close()
+                except:
+                    pass
+
+    async def _rtp_timeout_monitor(self, call_id: str):
+        """Monitor for RTP timeout (no audio for 3 seconds)"""
+        self._log.info(f"Starting RTP timeout monitor for call {call_id}")
+        try:
+            while call_id in self._active_calls and self._active_calls[call_id].state == "active":
+                await asyncio.sleep(1) # Check every second
+                call_state = self._active_calls.get(call_id)
+                if not call_state:
+                    break
+
+                time_since_last_rtp = time.time() - call_state.last_rtp_time
+                self._log.debug(f"RTP timeout check for call {call_id}: {time_since_last_rtp:.2f}s since last RTP")
+
+                if time_since_last_rtp >= 3:
+                    self._log.info(f"No RTP received for 3 seconds on call {call_id}. Hanging up.")
+                    await self._end_call(call_id, "rtp_timeout")
+                    break
+        except asyncio.CancelledError:
+            self._log.info(f"RTP timeout monitor for call {call_id} cancelled.")
 
     async def _setup_rtp(self):
         """Setup RTP socket for audio"""
@@ -541,73 +816,237 @@ a=rtpmap:0 PCMU/8000"""
         """Handle call termination"""
         call_id = msg['headers'].get('call-id', '')
         
-        if self._call.call_id == call_id:
+        if call_id in self._active_calls:
+            call_state = self._active_calls[call_id]
             response = self._create_response(200, "OK", call_id, msg['headers'])
-            self._transport.sendto(response, addr)
+            self._send_sip_message(response, addr, f"(200 OK for BYE - {call_state.flat_id})")
             
-            await self._end_call("remote_hangup")
-            self._log.info(f"Call ended by {addr}")
+            await self._end_call(call_id, "remote_hangup")
+            self._log.info(f"Call ended by {call_state.flat_id} ({addr})")
+        else:
+            # Send 481 Call/Transaction Does Not Exist
+            response = self._create_response(481, "Call/Transaction Does Not Exist", call_id, msg['headers'])
+            self._send_sip_message(response, addr, "(481 Call Does Not Exist)")
+            self._log.warning(f"Received BYE for unknown call {call_id} from {addr}")
 
     async def _call_timeout(self, call_id: str):
         """Handle call timeout (60 seconds)"""
         try:
             await asyncio.sleep(60)
-            if self._call.call_id == call_id and self._call.state in ("ringing", "active"):
-                await self._end_call("timeout")
-                self._log.info("Call timed out")
+            if call_id in self._active_calls and self._active_calls[call_id].state in ("ringing", "active"):
+                self._log.info(f"Call {call_id} timed out")
+                await self._end_call(call_id, "timeout")
         except asyncio.CancelledError:
             pass
 
-    async def _end_call(self, reason: str):
-        """End current call and cleanup"""
-        if self._call.state == "idle":
+    async def _end_call(self, call_id: str, reason: str = "normal"):
+        """End a specific call"""
+        self._log.info(f"Attempting to end call {call_id} for reason: {reason}")
+        if call_id not in self._active_calls:
+            self._log.debug(f"Call {call_id} not found, nothing to end")
             return
             
-        # Cancel any pending tasks
-        if self._auto_answer_task:
-            self._auto_answer_task.cancel()
-            self._auto_answer_task = None
+        call_state = self._active_calls[call_id]
+        flat_id = call_state.flat_id
+        remote_addr = call_state.remote_addr
+        
+        self._log.info(f"Ending call from {flat_id} ({call_id}) - reason: {reason}")
+        
+        try:
+            # Send BYE if call was active
+            if call_state.state == "active" and remote_addr:
+                try:
+                    bye_msg = f"BYE sip:{self._settings.SIP_USER}@{self._settings.SIP_DOMAIN} SIP/2.0\r\n"
+                    bye_msg += f"Via: SIP/2.0/UDP {socket.gethostbyname(socket.gethostname())}:{self._settings.SIP_PORT};branch=z9hG4bK-doorbell-bye\r\n"
+                    bye_msg += f"From: <sip:{self._settings.SIP_USER}@{self._settings.SIP_DOMAIN}>;tag=doorbell-tag\r\n"
+                    bye_msg += f"To: <sip:{flat_id}@{remote_addr[0]}>\r\n"
+                    bye_msg += f"Call-ID: {call_id}\r\n"
+                    bye_msg += f"CSeq: 1 BYE\r\n"
+                    bye_msg += "Content-Length: 0\r\n\r\n"
+                    
+                    self._send_sip_message(bye_msg.encode(), remote_addr, f"(BYE - {reason})")
+                    self._log.info(f"Sent BYE to {flat_id} ({remote_addr}) - reason: {reason}")
+                except Exception as e:
+                    self._log.error(f"Failed to send BYE to {flat_id}: {e}")
             
-        if self._call_timeout_task:
-            self._call_timeout_task.cancel()
-            self._call_timeout_task = None
+            # Cleanup RTP
+            if call_state.rtp_task:
+                call_state.rtp_task.cancel()
+            if call_state.timeout_task:
+                call_state.timeout_task.cancel()
+            if call_state.rtp_timeout_task:
+                call_state.rtp_timeout_task.cancel()
+            if call_state.rtp_socket:
+                try:
+                    call_state.rtp_socket.close()
+                except:
+                    pass
+        finally:
+            # Ensure call state is always cleaned up
+            if call_id in self._active_calls:
+                del self._active_calls[call_id]
+            if flat_id in self._flat_calls and self._flat_calls[flat_id] == call_id:
+                del self._flat_calls[flat_id]
             
-        if self._rtp_task:
-            self._rtp_task.cancel()
-            self._rtp_task = None
-        
-        # Send BYE if we're ending the call
-        if reason in ("timeout", "hangup") and self._call.remote_addr:
-            bye_msg = f"BYE sip:{self._settings.SIP_USER}@{self._settings.SIP_DOMAIN} SIP/2.0\r\n"
-            bye_msg += f"Call-ID: {self._call.call_id}\r\n"
-            bye_msg += "Content-Length: 0\r\n\r\n"
-            self._transport.sendto(bye_msg.encode(), self._call.remote_addr)
-        
-        old_state = self._call.state
-        remote_addr = self._call.remote_addr
-        
-        # Reset call state
-        self._call = CallState()
-        
-        await self._event_bus.emit("SIP_CALL_ENDED", {"reason": reason, "addr": remote_addr, "was_active": old_state == "active"})
+            await self._event_bus.emit("SIP_CALL_ENDED", {
+                "reason": reason, 
+                "flat_id": flat_id,
+                "addr": remote_addr, 
+                "call_id": call_id
+            })
+            
+            self._log.info(f"Call ended: {flat_id} ({call_id}) - {reason}")
 
+    
     async def hangup_call(self):
-        """Manually hang up current call"""
-        if self._call.state != "idle":
-            await self._end_call("hangup")
-            self._log.info("Call manually hung up")
+        """Hang up all active calls"""
+        self._log.info(f"Hangup requested - {len(self._active_calls)} active calls")
+        if self._active_calls:
+            call_ids = list(self._active_calls.keys())
+            for call_id in call_ids:
+                await self._end_call(call_id, "manual_hangup")
+            self._log.info("All calls manually hung up")
+        else:
+            self._log.info("No active calls to hang up")
+
+    async def hangup_flat_call(self, flat_id: str):
+        """Hang up call from specific flat"""
+        if flat_id in self._flat_calls:
+            call_id = self._flat_calls[flat_id]
+            await self._end_call(call_id, "manual_hangup")
+            self._log.info(f"Call from {flat_id} manually hung up")
+        else:
+            self._log.info(f"No active call from {flat_id}")
 
     def get_call_info(self) -> dict:
-        """Get current call information"""
+        """Get information about all active calls"""
         if not self._settings.SIP_ENABLED:
             return {"enabled": False}
             
+        calls_info = {}
+        for call_id, call_state in self._active_calls.items():
+            calls_info[call_id] = {
+                "flat_id": call_state.flat_id,
+                "state": call_state.state,
+                "remote_addr": call_state.remote_addr,
+                "duration": time.time() - call_state.answer_time if call_state.answer_time > 0 else 0,
+                "rtp_port": call_state.rtp_port
+            }
+            
         return {
             "enabled": True,
-            "state": self._call.state,
-            "active": self.is_call_active,
-            "duration": time.time() - self._call.answer_time if self._call.answer_time > 0 else 0
+            "active_calls": len(self._active_calls),
+            "calls": calls_info,
+            "flats": list(self._allowed_flats.keys()),
+            "any_active": self.is_call_active
         }
+
+    async def _handle_ack(self, msg: dict, addr: tuple):
+        """Handle ACK message - call is established"""
+        self._log.info(f"ACK received from {addr} - call established")
+        # ACK confirms the 200 OK response, call is now fully established
+
+    async def _handle_cancel(self, msg: dict, addr: tuple):
+        """Handle CANCEL message - caller wants to cancel the call"""
+        call_id = msg['headers'].get('call-id', '')
+        self._log.info(f"CANCEL received from {addr} for call {call_id}")
+
+        if call_id in self._active_calls and self._active_calls[call_id].state == "ringing":
+            # Send 200 OK to CANCEL
+            response = self._create_response(200, "OK", call_id, msg['headers'])
+            self._send_sip_message(response, addr, "(200 OK for CANCEL)")
+
+            # Send 487 Request Terminated to original INVITE
+            # (This would require tracking the original INVITE, simplified here)
+
+            await self._end_call(call_id, "cancelled")
+        else:
+            # Send 481 Call/Transaction Does Not Exist
+            response = self._create_response(481, "Call/Transaction Does Not Exist", call_id, msg['headers'])
+            self._send_sip_message(response, addr, "(481 Call Does Not Exist)")
+
+    async def _handle_register(self, msg: dict, addr: tuple):
+        """Handle REGISTER message - client registration"""
+        call_id = msg['headers'].get('call-id', '')
+        self._log.info(f"REGISTER received from {addr}")
+        
+        # Simple registration acceptance (no authentication)
+        response = self._create_response(200, "OK", call_id, msg['headers'])
+        self._send_sip_message(response, addr, "(200 OK for REGISTER)")
+
+    async def _handle_options(self, msg: dict, addr: tuple):
+        """Handle OPTIONS message - capability query"""
+        call_id = msg['headers'].get('call-id', '')
+        self._log.info(f"OPTIONS received from {addr}")
+        
+        # Respond with supported methods
+        response = f"SIP/2.0 200 OK\r\n"
+        response += f"Call-ID: {call_id}\r\n"
+        response += f"Via: {msg['headers'].get('via', '')}\r\n"
+        response += f"From: {msg['headers'].get('from', '')}\r\n"
+        response += f"To: {msg['headers'].get('to', '')}\r\n"
+        response += f"CSeq: {msg['headers'].get('cseq', '')}\r\n"
+        response += "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, INFO\r\n"
+        response += "Content-Length: 0\r\n\r\n"
+        self._send_sip_message(response.encode(), addr, "(200 OK for OPTIONS)")
+
+    async def _handle_info(self, msg: dict, addr: tuple):
+        """Handle INFO message - mid-call information"""
+        call_id = msg['headers'].get('call-id', '')
+        self._log.info(f"INFO received from {addr} for call {call_id}")
+
+        if call_id in self._active_calls:
+            response = self._create_response(200, "OK", call_id, msg['headers'])
+            self._send_sip_message(response, addr, "(200 OK for INFO)")
+        else:
+            response = self._create_response(481, "Call/Transaction Does Not Exist", call_id, msg['headers'])
+            self._send_sip_message(response, addr, "(481 Call Does Not Exist)")
+
+    async def _handle_prack(self, msg: dict, addr: tuple):
+        """Handle PRACK message - provisional response acknowledgment"""
+        call_id = msg['headers'].get('call-id', '')
+        self._log.info(f"PRACK received from {addr} for call {call_id}")
+
+        response = self._create_response(200, "OK", call_id, msg['headers'])
+        self._send_sip_message(response, addr, "(200 OK for PRACK)")
+
+    async def _handle_update(self, msg: dict, addr: tuple):
+        """Handle UPDATE message - session parameter update"""
+        call_id = msg['headers'].get('call-id', '')
+        self._log.info(f"UPDATE received from {addr} for call {call_id}")
+
+        if call_id in self._active_calls:
+            response = self._create_response(200, "OK", call_id, msg['headers'])
+            self._send_sip_message(response, addr, "(200 OK for UPDATE)")
+        else:
+            response = self._create_response(481, "Call/Transaction Does Not Exist", call_id, msg['headers'])
+            self._send_sip_message(response, addr, "(481 Call Does Not Exist)")
+
+    async def _handle_refer(self, msg: dict, addr: tuple):
+        """Handle REFER message - call transfer request"""
+        call_id = msg['headers'].get('call-id', '')
+        self._log.info(f"REFER received from {addr} for call {call_id}")
+        
+        # We don't support call transfer, send 501 Not Implemented
+        response = self._create_response(501, "Not Implemented", call_id, msg['headers'])
+        self._send_sip_message(response, addr, "(501 Not Implemented for REFER)")
+
+    async def _handle_notify(self, msg: dict, addr: tuple):
+        """Handle NOTIFY message - event notification"""
+        call_id = msg['headers'].get('call-id', '')
+        self._log.info(f"NOTIFY received from {addr} for call {call_id}")
+        
+        response = self._create_response(200, "OK", call_id, msg['headers'])
+        self._send_sip_message(response, addr, "(200 OK for NOTIFY)")
+
+    async def _handle_subscribe(self, msg: dict, addr: tuple):
+        """Handle SUBSCRIBE message - event subscription"""
+        call_id = msg['headers'].get('call-id', '')
+        self._log.info(f"SUBSCRIBE received from {addr} for call {call_id}")
+        
+        # We don't support subscriptions, send 501 Not Implemented
+        response = self._create_response(501, "Not Implemented", call_id, msg['headers'])
+        self._send_sip_message(response, addr, "(501 Not Implemented for SUBSCRIBE)")
 
     class _SIPProtocol(asyncio.DatagramProtocol):
         def __init__(self, server: 'SIPServer'):
@@ -622,23 +1061,65 @@ a=rtpmap:0 PCMU/8000"""
     async def _handle_message(self, data: bytes, addr: tuple):
         """Handle incoming SIP message"""
         try:
+            # Enhanced logging for all incoming SIP messages
+            import time
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            raw_message = data.decode('utf-8', errors='ignore')
+            
+            self._log.info(f"=== INCOMING SIP MESSAGE FROM {addr} ===")
+            self._log.info(f"Timestamp: {timestamp}")
+            self._log.info(f"Size: {len(data)} bytes")
+            self._log.info(raw_message)
+            self._log.info("=== END SIP MESSAGE ===")
+            
+            # Log to separate SIP log
+            self._log_sip_message("INCOMING", addr, raw_message)
+            
             msg = self._parse_sip_message(data)
             if not msg:
+                self._log.warning(f"Failed to parse SIP message from {addr}")
                 return
                 
             method = msg.get('method', '')
-            self._log.debug(f"SIP {method} from {addr}")
+            self._log.info(f"SIP {method} from {addr}")
             
+            # Handle all SIP methods
             if method == "INVITE":
                 await self._handle_invite(msg, addr)
             elif method == "BYE":
                 await self._handle_bye(msg, addr)
             elif method == "ACK":
-                # ACK for 200 OK - call is established
-                pass
+                await self._handle_ack(msg, addr)
+            elif method == "CANCEL":
+                await self._handle_cancel(msg, addr)
+            elif method == "REGISTER":
+                await self._handle_register(msg, addr)
+            elif method == "OPTIONS":
+                await self._handle_options(msg, addr)
+            elif method == "INFO":
+                await self._handle_info(msg, addr)
+            elif method == "PRACK":
+                await self._handle_prack(msg, addr)
+            elif method == "UPDATE":
+                await self._handle_update(msg, addr)
+            elif method == "REFER":
+                await self._handle_refer(msg, addr)
+            elif method == "NOTIFY":
+                await self._handle_notify(msg, addr)
+            elif method == "SUBSCRIBE":
+                await self._handle_subscribe(msg, addr)
+            else:
+                self._log.warning(f"Unhandled SIP method: {method} from {addr}")
+                # Send 501 Not Implemented for unknown methods
+                if msg['headers'].get('call-id'):
+                    response = self._create_response(501, "Not Implemented", 
+                                                   msg['headers']['call-id'], msg['headers'])
+                    self._send_sip_message(response, addr, f"(501 Not Implemented for {method})")
                 
         except Exception as e:
             self._log.error(f"SIP message error: {e}")
+            import traceback
+            self._log.error(f"Traceback: {traceback.format_exc()}")
 
 
 # =============================================================================
@@ -778,73 +1259,6 @@ class VideoBufferManager:
                     frames.append(boundary.encode() + b"\r\n" + part + b"\r\n")
         
         return frames
-# =============================================================================
-# Video Buffer Manager
-# =============================================================================
-class VideoBufferManager:
-    def __init__(self, settings: Settings):
-        self._settings = settings
-        self._buffer = b""
-        self._lock = asyncio.Lock()
-        self._buffering = False
-
-    async def start_buffering(self):
-        if self._buffering:
-            return
-        self._buffering = True
-        logger.info("Starting video buffering")
-        asyncio.create_task(self._capture_stream())
-
-    async def stop_buffering(self):
-        self._buffering = False
-        async with self._lock:
-            self._buffer = b""
-        logger.info("Stopped video buffering")
-
-    async def get_stream(self):
-        """Stream buffered content then live stream"""
-        # First yield buffered content if available
-        async with self._lock:
-            if self._buffer:
-                yield self._buffer
-        
-        # Always stream live regardless of buffering state
-        url = f"http://{self._settings.AXIS_USERNAME}:{self._settings.AXIS_PASSWORD}@{self._settings.AXIS_HOSTNAME}/axis-cgi/mjpg/video.cgi"
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            async with client.stream("GET", url) as response:
-                async for chunk in response.aiter_bytes():
-                    # Also buffer if we're in buffering mode
-                    if self._buffering:
-                        async with self._lock:
-                            self._buffer += chunk
-                            if len(self._buffer) > 1024 * 1024:  # 1MB max
-                                self._buffer = self._buffer[-512 * 1024:]  # Keep last 512KB
-                    yield chunk
-
-    async def _capture_stream(self):
-        url = f"http://{self._settings.AXIS_USERNAME}:{self._settings.AXIS_PASSWORD}@{self._settings.AXIS_HOSTNAME}/axis-cgi/mjpg/video.cgi"
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                async with client.stream("GET", url) as response:
-                    buffer_size = 0
-                    max_buffer = 1024 * 1024  # 1MB buffer
-                    
-                    async for chunk in response.aiter_bytes():
-                        if not self._buffering:
-                            break
-                            
-                        async with self._lock:
-                            self._buffer += chunk
-                            buffer_size += len(chunk)
-                            
-                            # Keep buffer size manageable
-                            if buffer_size > max_buffer:
-                                self._buffer = self._buffer[-max_buffer//2:]
-                                buffer_size = len(self._buffer)
-                                
-        except Exception as e:
-            logger.error(f"Video capture error: {e}")
-
 
 class CameraFetcher:
     def __init__(self, settings: Settings, active_state: ActiveState):
@@ -1015,6 +1429,10 @@ class UDPServer:
         self._event_bus = event_bus
         self._transport: asyncio.DatagramTransport | None = None
         self._bcast_task: asyncio.Task | None = None
+        self._bcast_socket: socket.socket | None = None
+        
+        # Subscribe to button press events
+        self._event_bus.subscribe("BELL_PRESSED", self._handle_bell_pressed)
 
     async def start(self, loop: asyncio.AbstractEventLoop):
         if self._settings.UDP_LISTEN_PORT > 0:
@@ -1023,13 +1441,20 @@ class UDPServer:
                 local_addr=("0.0.0.0", self._settings.UDP_LISTEN_PORT),
                 allow_broadcast=True,
             )
+        
+        # Create broadcast socket for immediate sending (button presses)
         if self._settings.UDP_BROADCAST_ENABLED:
+            self._bcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            self._bcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             self._bcast_task = asyncio.create_task(self._broadcast_loop())
 
     async def stop(self):
         logger.info("Stopping UDP services")
         if self._transport:
             self._transport.close()
+        if self._bcast_socket:
+            self._bcast_socket.close()
+            self._bcast_socket = None
         if self._bcast_task:
             self._bcast_task.cancel()
             try:
@@ -1059,6 +1484,27 @@ class UDPServer:
             transport.sendto(b"OK", addr)
         else:
             transport.sendto(b"ERR unknown command", addr)
+
+    async def _handle_bell_pressed(self, button_number: int):
+        """Handle BELL_PRESSED event by broadcasting UDP message"""
+        if not self._settings.UDP_BROADCAST_ENABLED or not self._bcast_socket:
+            return
+            
+        log = logging.getLogger("doorbell.udp.broadcast")
+        addr = (self._settings.UDP_BCAST_ADDR, self._settings.UDP_BCAST_PORT)
+        
+        payload = json.dumps({
+            "type": "doorbell_button_pressed",
+            "button": button_number,
+            "timestamp": time.time(),
+            "active": self._active_state.is_active,
+        }).encode()
+        
+        try:
+            self._bcast_socket.sendto(payload, addr)
+            log.info(f"Broadcasted button {button_number} press to {addr[0]}:{addr[1]}")
+        except Exception as e:
+            log.warning(f"Button press broadcast failed: {e}")
 
     async def _broadcast_loop(self):
         log = logging.getLogger("doorbell.udp.broadcast")
@@ -1134,8 +1580,58 @@ async def proxy_video_endpoint(request):
     )
 
 async def sip_hangup_endpoint(request):
-    await sip_server.hangup_call()
-    return JSONResponse({"status": "call ended"})
+    logger.info("=== SIP HANGUP ENDPOINT CALLED ===")
+    logger.info(f"Request method: {request.method}")
+    logger.info(f"Request headers: {dict(request.headers)}")
+    
+    try:
+        call_info_before = sip_server.get_call_info()
+        logger.info(f"Call info before hangup: {call_info_before}")
+        
+        await sip_server.hangup_call()
+        
+        call_info_after = sip_server.get_call_info()
+        logger.info(f"Call info after hangup: {call_info_after}")
+        
+        logger.info("=== SIP HANGUP ENDPOINT COMPLETED SUCCESSFULLY ===")
+        return JSONResponse({
+            "status": "call ended", 
+            "before": call_info_before,
+            "after": call_info_after
+        })
+    except Exception as e:
+        logger.error(f"SIP hangup endpoint error: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+async def sip_hangup_flat_endpoint(request):
+    """Hang up call from specific flat"""
+    flat_id = request.path_params.get("flat_id")
+    logger.info(f"=== SIP HANGUP FLAT ENDPOINT CALLED FOR {flat_id} ===")
+    
+    try:
+        call_info_before = sip_server.get_call_info()
+        logger.info(f"Call info before hangup: {call_info_before}")
+        
+        if hasattr(sip_server, 'hangup_flat_call'):
+            await sip_server.hangup_flat_call(flat_id)
+        else:
+            # Fallback for older SIP server
+            await sip_server.hangup_call()
+        
+        call_info_after = sip_server.get_call_info()
+        logger.info(f"Call info after hangup: {call_info_after}")
+        
+        return JSONResponse({
+            "status": f"call from {flat_id} ended", 
+            "flat_id": flat_id,
+            "before": call_info_before,
+            "after": call_info_after
+        })
+    except Exception as e:
+        logger.error(f"SIP hangup flat endpoint error: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 async def healthz_endpoint(request):
     return PlainTextResponse("ok")
@@ -1145,6 +1641,7 @@ routes = [
     Route("/image", get_lazy_image_endpoint),
     Route("/video", proxy_video_endpoint),
     Route("/sip/hangup", sip_hangup_endpoint, methods=["POST"]),
+    Route("/sip/hangup/{flat_id}", sip_hangup_flat_endpoint, methods=["POST"]),
     Route("/healthz", healthz_endpoint),
 ]
 
@@ -1157,7 +1654,10 @@ camera_fetcher = CameraFetcher(settings, active_state)
 video_stream = VideoStreamManager(settings)
 udp_server = UDPServer(settings, active_state, event_bus)
 audio_manager = AudioManager(settings)
-sip_server = SIPServer(settings, event_bus, audio_manager)
+if PYSIP_AVAILABLE:
+    sip_server = PySIPServer(settings, event_bus)
+else:
+    sip_server = SIPServer(settings, event_bus, audio_manager)
 gpio_manager: GPIOManager | None = None
 
 # Link active state with SIP server
@@ -1169,6 +1669,25 @@ event_bus.subscribe("BELL_PRESSED", active_state.handle_bell_pressed)
 async def lifespan(app: Starlette):
     global gpio_manager
     loop = asyncio.get_running_loop()
+    
+    # Register signal handlers - simplified approach
+    import signal
+    import os
+    
+    def immediate_exit_handler(signum, frame):
+        print(f"\nReceived signal {signum}, forcing immediate exit...")
+        try:
+            # Try to hang up any active call quickly
+            if sip_server.is_call_active:
+                print("Hanging up active call...")
+        except:
+            pass
+        print("Exiting now...")
+        os._exit(0)
+    
+    # Use the standard signal.signal() instead of loop.add_signal_handler()
+    signal.signal(signal.SIGINT, immediate_exit_handler)
+    signal.signal(signal.SIGTERM, immediate_exit_handler)
     
     logger.info("Application starting...")
     gpio_manager = GPIOManager(settings, event_bus, loop)
@@ -1185,14 +1704,18 @@ async def lifespan(app: Starlette):
         yield
     finally:
         logger.info("Application shutting down...")
-        await udp_server.stop()
-        await sip_server.stop()
-        await audio_manager.shutdown()
+        # Perform graceful shutdown
+        if sip_server:
+            await sip_server.stop()
+        if audio_manager:
+            await audio_manager.shutdown()
+        if udp_server:
+            await udp_server.stop()
         if gpio_manager:
             gpio_manager.stop()
-        await camera_fetcher.shutdown()
-        await active_state.shutdown()
-        logger.info("Shutdown complete.")
+        if camera_fetcher:
+            await camera_fetcher.shutdown()
+        logger.info("Cleanup complete.")
 
 app = Starlette(routes=routes, lifespan=lifespan)
 
@@ -1201,15 +1724,41 @@ app = Starlette(routes=routes, lifespan=lifespan)
 # =============================================================================
 def main():
     """Entry point for the doorbell application"""
+    import os
+    # Test file write to diagnose output issues
+    try:
+        with open("/tmp/doorbell_test_write.log", "a") as f:
+            f.write(f"[{os.getpid()}] Doorbell application started successfully at {time.time()}\n")
+    except Exception as e:
+        print(f"ERROR: Could not write to /tmp/doorbell_test_write.log: {e}", file=sys.stderr)
+
+
     import uvicorn
-    # --- MODIFICATION: Added log_config=None to prevent Uvicorn from
-    # --- overriding our logging setup.
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        log_config=None
-    )
+    import signal
+    import sys
+    
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, shutting down gracefully...")
+        sys.exit(0)
+    
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        # --- MODIFICATION: Added log_config=None to prevent Uvicorn from
+        # --- overriding our logging setup.
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=settings.HTTP_PORT,
+            log_config=None
+        )
+    except KeyboardInterrupt:
+        logger.info("Received KeyboardInterrupt, shutting down...")
+    except Exception as e:
+        logger.error(f"Application error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
