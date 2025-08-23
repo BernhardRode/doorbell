@@ -700,7 +700,8 @@ a=rtpmap:0 PCMU/8000"""
             rtp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             rtp_socket.bind(('0.0.0.0', 0))  # Let system assign port
             rtp_port = rtp_socket.getsockname()[1]
-            
+            rtp_socket.setblocking(False)
+                        
             call_state.rtp_socket = rtp_socket
             
             # Start RTP receiver task for this call
@@ -732,17 +733,27 @@ a=rtpmap:0 PCMU/8000"""
                 try:
                     try:
                         data, addr = await asyncio.wait_for(loop.sock_recvfrom(rtp_socket, 1024), timeout=1.0)
-                        # Simple RTP parsing (skip 12-byte header)
                         if len(data) > 12:
-                            call_state.last_rtp_time = time.time()
+                            call_state.last_rtp_time = time.time()  # update on every packet
                             audio_payload = data[12:]
-                            # Play audio from this flat
                             await self._audio_manager.play_audio(audio_payload)
-
-                            # Log which flat is speaking
                             self._log.info(f"Audio from {call_state.flat_id}: {len(audio_payload)} bytes")
                     except asyncio.TimeoutError:
-                        continue # Go to the next iteration of the while loop
+                        # No data this second, let loop continue so timeout monitor can act
+                        continue
+                    # try:
+                    #     data, addr = await asyncio.wait_for(loop.sock_recvfrom(rtp_socket, 1024), timeout=1.0)
+                    #     # Simple RTP parsing (skip 12-byte header)
+                    #     if len(data) > 12:
+                    #         call_state.last_rtp_time = time.time()
+                    #         audio_payload = data[12:]
+                    #         # Play audio from this flat
+                    #         await self._audio_manager.play_audio(audio_payload)
+
+                    #         # Log which flat is speaking
+                    #         self._log.info(f"Audio from {call_state.flat_id}: {len(audio_payload)} bytes")
+                    # except asyncio.TimeoutError:
+                    #     continue # Go to the next iteration of the while loop
                 except Exception as e:
                     if call_id in self._active_calls:  # Only log if call still exists
                         self._log.error(f"RTP receive error for {call_state.flat_id}: {e}")
